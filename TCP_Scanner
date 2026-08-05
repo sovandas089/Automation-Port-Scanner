@@ -1,0 +1,337 @@
+#!/bin/bash
+# ─────────────────────────────────────────────
+#  Parallel TCP Nmap Scanner v4.1
+#  T1046 — Network Service Discovery
+#  Fixed: arithmetic syntax errors, spinner,
+#  printf-based progress, UDP-style loading UI
+# ─────────────────────────────────────────────
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+# ── Spinner frames ────────────────────────────
+SPIN=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+
+# ── Root check ────────────────────────────────
+if [[ $EUID -ne 0 ]]; then
+    echo -e "${RED}[!] TCP SYN scan requires root. Run with sudo.${NC}"
+    exit 1
+fi
+
+# ── Dependency check ──────────────────────────
+if ! command -v nmap >/dev/null 2>&1; then
+    echo -e "${RED}[!] nmap is not installed or not in PATH.${NC}"
+    exit 1
+fi
+
+# ── IP input ──────────────────────────────────
+if [[ -n "$1" ]]; then
+    TARGET="$1"
+else
+    echo -e "${CYAN}${BOLD}"
+    echo "  ╔════════════════════════════════════════╗"
+    echo "  ║    Parallel TCP Nmap Scanner v4.1      ║"
+    echo "  ║    T1046 — Network Service Discovery   ║"
+    echo "  ╚════════════════════════════════════════╝"
+    echo -e "${NC}"
+    read -rp "  Enter target IP: " TARGET
+fi
+
+# ── Validate IPv4 ─────────────────────────────
+if ! [[ "$TARGET" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    echo -e "${RED}[!] Invalid IP address: $TARGET${NC}"
+    exit 1
+fi
+IFS='.' read -r o1 o2 o3 o4 <<< "$TARGET"
+for octet in "$o1" "$o2" "$o3" "$o4"; do
+    if (( octet < 0 || octet > 255 )); then
+        echo -e "${RED}[!] Invalid IP address: $TARGET${NC}"
+        exit 1
+    fi
+done
+
+# ── Setup dirs ────────────────────────────────
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+OUTDIR="tcp_scan_${TARGET//./_}_${TIMESTAMP}"
+PROGRESS_DIR="$OUTDIR/.progress"
+mkdir -p "$OUTDIR" "$PROGRESS_DIR"
+
+FINAL_OUT="$OUTDIR/FULL_SCAN_${TARGET//./_}.txt"
+OPEN_PORTS_FILE="$OUTDIR/open_ports.txt"
+
+RANGES=("1-16383" "16384-32767" "32768-49151" "49152-65535")
+START_EPOCH=$(date +%s)
+
+echo -e "\n${GREEN}${BOLD}[+] Target     : $TARGET${NC}"
+echo -e "${GREEN}[+] Output dir : $OUTDIR${NC}"
+echo -e "${GREEN}[+] Started    : $(date)${NC}\n"
+
+# ── draw_bar: fill% out of 20 chars ──────────
+draw_bar() {
+    local pct=${1:-0} width=20 filled empty bar=""
+    [[ "$pct" =~ ^[0-9]+$ ]] || pct=0
+    (( pct < 0 )) && pct=0
+    (( pct > 100 )) && pct=100
+    filled=$(( pct * width / 100 ))
+    empty=$(( width - filled ))
+    for ((i=0; i<filled; i++)); do bar+="█"; done
+    for ((i=0; i<empty; i++)); do bar+="░"; done
+    printf "%s" "$bar"
+}
+
+# ── elapsed: mm:ss since START_EPOCH ─────────
+elapsed() {
+    local s=$(( $(date +%s) - START_EPOCH ))
+    printf "%02dm%02ds" $(( s/60 )) $(( s%60 ))
+}
+
+# ── safely extract nmap progress percentage ──
+get_pct_from_log() {
+    local logfile=$1 raw intpart
+    raw=$(grep -oE 'About [0-9]+(\.[0-9]+)?% done' "$logfile" 2>/dev/null | tail -1 | grep -oE '[0-9]+(\.[0-9]+)?' || true)
+    raw=${raw:-0}
+    intpart=${raw%%.*}
+    [[ "$intpart" =~ ^[0-9]+$ ]] || intpart=0
+    (( intpart > 100 )) && intpart=100
+    printf "%d" "$intpart"
+}
+
+# ── count open TCP ports in one part file ─────
+count_open_in_file() {
+    local file=$1 found
+    found=$(grep -cE '^[0-9]+/tcp[[:space:]]+open' "$file" 2>/dev/null || true)
+    [[ "$found" =~ ^[0-9]+$ ]] || found=0
+    printf "%d" "$found"
+}
+
+# ── Phase 1: Parallel TCP SYN scan ───────────
+echo -e "${YELLOW}${BOLD}[*] Phase 1 — Full TCP SYN scan (1-65535) — 4 parallel jobs${NC}"
+echo -e "${DIM}    Rate: 300 pkts/s | max-retries: 2 | ~16383 ports each${NC}\n"
+
+# Print 7 blank lines that the redraw loop will overwrite
+for i in $(seq 7); do echo ""; done
+
+for i in 1 2 3 4; do
+    nmap -sS -Pn -T4 -v \
+      -p "${RANGES[$((i-1))]}" \
+      --max-rate 300 --max-retries 2 \
+      "$TARGET" \
+      -oN "$OUTDIR/part${i}.txt" \
+      > "$PROGRESS_DIR/log${i}.txt" 2>&1 &
+    eval "PID${i}=$!"
+done
+
+PIDS=($PID1 $PID2 $PID3 $PID4)
+DONE_TIMES=("" "" "" "")
+
+# ── Progress redraw loop: matches UDP style ───
+while true; do
+    ALL_DONE=1
+    TOTAL_PCT=0
+    NOW=$(date +%s)
+    ELAPSED_S=$(( NOW - START_EPOCH ))
+
+    # Move cursor up 7 lines to overwrite
+    printf "\033[7A"
+
+    # Header line
+    printf "\033[2K  \033[1m\033[0;36mJob Progress:\033[0m\n"
+
+    for i in 0 1 2 3; do
+        JN=$(( i+1 ))
+        PID="${PIDS[$i]}"
+        RANGE="${RANGES[$i]}"
+
+        if kill -0 "$PID" 2>/dev/null; then
+            ALL_DONE=0
+            PCT=$(get_pct_from_log "$PROGRESS_DIR/log${JN}.txt")
+            STATUS="\033[0;36mscanning\033[0m"
+            TSTR=""
+        else
+            PCT=100
+            STATUS="\033[0;32mdone    \033[0m"
+            if [[ -z "${DONE_TIMES[$i]}" ]]; then
+                DONE_TIMES[$i]=$NOW
+            fi
+            JD=$(( ${DONE_TIMES[$i]} - START_EPOCH ))
+            FOUND=$(count_open_in_file "$OUTDIR/part${JN}.txt")
+            if (( FOUND > 0 )); then
+                TSTR=" \033[0;32m(${FOUND} open ports)\033[0m"
+            else
+                TSTR=" \033[2m(${JD}s)\033[0m"
+            fi
+        fi
+
+        TOTAL_PCT=$(( TOTAL_PCT + PCT ))
+        BAR=$(draw_bar "$PCT")
+        printf "\033[2K  \033[1mJob %d\033[0m [\033[0;33m%s\033[0m] [%b] %3d%% — ports %-15s%b\n" \
+          "$JN" "$BAR" "$STATUS" "$PCT" "$RANGE" "$TSTR"
+    done
+
+    OVERALL=$(( TOTAL_PCT / 4 ))
+    OBAR=$(draw_bar "$OVERALL")
+
+    ETA_STR="calculating..."
+    if (( OVERALL > 0 && OVERALL < 100 && ELAPSED_S > 0 )); then
+        ETA_S=$(( ELAPSED_S * (100 - OVERALL) / OVERALL ))
+        ETA_STR=$(printf "%02dm%02ds" $(( ETA_S/60 )) $(( ETA_S%60 )))
+    elif (( OVERALL == 100 )); then
+        ETA_STR="done"
+    fi
+
+    printf "\033[2K\n"
+    printf "\033[2K  \033[1mOverall: [\033[0;32m%s\033[0m] %3d%% | Elapsed: %s | ETA: %s\033[0m\n" \
+      "$OBAR" "$OVERALL" "$(elapsed)" "$ETA_STR"
+
+    [[ $ALL_DONE -eq 1 ]] && break
+    sleep 3
+done
+
+wait "$PID1" "$PID2" "$PID3" "$PID4"
+echo -e "\n${GREEN}[+] All parallel jobs complete${NC}\n"
+
+# ── Extract open ports ────────────────────────
+echo -e "${YELLOW}[*] Extracting open ports...${NC}"
+
+grep -hE '^[0-9]+/tcp[[:space:]]+open' "$OUTDIR"/part*.txt 2>/dev/null | \
+  awk -F'/' '{print $1}' | sort -nu > "$OPEN_PORTS_FILE"
+
+OPEN_COUNT=$(wc -l < "$OPEN_PORTS_FILE" | tr -d ' ')
+OPEN_LIST=$(paste -sd',' "$OPEN_PORTS_FILE")
+
+echo -e "${GREEN}[+] Open TCP ports found : $OPEN_COUNT${NC}"
+[[ -n "$OPEN_LIST" ]] && echo -e "${GREEN}[+] Ports: $OPEN_LIST${NC}\n"
+
+# ── Phase 2: Deep scan on open ports ─────────
+if [[ -n "$OPEN_LIST" ]]; then
+    echo -e "${YELLOW}${BOLD}[*] Phase 2 — Deep service/version + vulnerability detection${NC}"
+    echo -e "${DIM}    Scripts: vuln,auth,default,banner | version-intensity: 9${NC}\n"
+    P2_START=$(date +%s)
+
+    nmap -sV -sC -Pn -T4 -v \
+      --version-intensity 9 \
+      -p "$OPEN_LIST" \
+      --script "vuln,auth,default,banner" \
+      --script-args "vulns.showall=true" \
+      "$TARGET" \
+      -oN "$OUTDIR/deep_scan.txt" \
+      -oX "$OUTDIR/deep_scan.xml" \
+      > "$PROGRESS_DIR/log_deep.txt" 2>&1 &
+    P2_PID=$!
+
+    # UDP-style spinner + progress bar for deep scan
+    SI=0
+    while kill -0 "$P2_PID" 2>/dev/null; do
+        PCT=$(get_pct_from_log "$PROGRESS_DIR/log_deep.txt")
+        BAR=$(draw_bar "$PCT")
+        printf "\r  \033[0;36m%s\033[0m Deep scan: [\033[0;33m%s\033[0m] %3d%% | %s elapsed   " \
+          "${SPIN[$SI]}" "$BAR" "$PCT" "$(elapsed)"
+        SI=$(( (SI+1) % ${#SPIN[@]} ))
+        sleep 0.2
+    done
+    wait "$P2_PID"
+    P2_DUR=$(( $(date +%s) - P2_START ))
+
+    VULN_COUNT=$(grep -cE 'VULNERABLE|CVE-[0-9]' "$OUTDIR/deep_scan.txt" 2>/dev/null || true)
+    [[ "$VULN_COUNT" =~ ^[0-9]+$ ]] || VULN_COUNT=0
+
+    printf "\r  \033[0;32m✓ Deep scan done\033[0m [\033[0;32m%s\033[0m] 100%% | %ds" \
+      "$(draw_bar 100)" "$P2_DUR"
+    if (( VULN_COUNT > 0 )); then
+        printf "  \033[0;31m[%d vulnerability hits]\033[0m" "$VULN_COUNT"
+    else
+        printf "  \033[2m[no vulns flagged]\033[0m"
+    fi
+    printf "                 \n\n"
+
+    # ── CVE summary ───────────────────────────
+    echo -e "${YELLOW}[*] Extracting vulnerability summary...${NC}"
+    CVE_LIST=$(grep -oE 'CVE-[0-9]{4}-[0-9]+' "$OUTDIR/deep_scan.txt" 2>/dev/null | sort -u || true)
+    if [[ -n "$CVE_LIST" ]]; then
+        echo -e "${RED}[!] CVEs detected:${NC}"
+        echo "$CVE_LIST" | while read -r cve; do
+            echo -e "    ${RED}▸ $cve${NC}"
+        done
+    else
+        echo -e "${DIM}    No CVEs found in output${NC}"
+    fi
+    echo ""
+else
+    echo -e "${RED}[!] No open TCP ports found — skipping deep scan${NC}\n"
+fi
+
+# ── Merge report ──────────────────────────────
+echo -e "${YELLOW}[*] Generating merged report → $FINAL_OUT${NC}"
+TOTAL_ELAPSED=$(( $(date +%s) - START_EPOCH ))
+TOTAL_MIN=$(( TOTAL_ELAPSED / 60 ))
+TOTAL_SEC=$(( TOTAL_ELAPSED % 60 ))
+
+{
+echo "════════════════════════════════════════════════════════════════"
+echo "  PARALLEL TCP NMAP SCAN REPORT"
+echo "  Target      : $TARGET"
+echo "  Date        : $(date)"
+echo "  Duration    : ${TOTAL_MIN}m ${TOTAL_SEC}s"
+echo "  Tool        : parallel_tcp_nmap_v2.sh v4.1 (T1046)"
+echo "════════════════════════════════════════════════════════════════"
+echo ""
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  PHASE 1 — TCP SYN SCAN SUMMARY (ports 1-65535)"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+echo "  Open TCP ports : $OPEN_COUNT"
+echo "  Port list      : ${OPEN_LIST:-none}"
+echo ""
+for i in 1 2 3 4; do
+    echo "  [Part $i: ${RANGES[$((i-1))]}]"
+    grep -E '^[0-9]+/tcp[[:space:]]+(open|filtered)' "$OUTDIR/part${i}.txt" 2>/dev/null \
+      || echo "    No open ports"
+    echo ""
+done
+
+if [[ -f "$OUTDIR/deep_scan.txt" ]]; then
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  PHASE 2 — SERVICE / VERSION / VULNERABILITY DETECTION"
+echo "  Scripts: vuln,auth,default,banner"
+echo "  Version intensity: 9 | XML output: deep_scan.xml"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+REPORT_VULNS=$(grep -oE 'CVE-[0-9]{4}-[0-9]+' "$OUTDIR/deep_scan.txt" 2>/dev/null | sort -u || true)
+if [[ -n "$REPORT_VULNS" ]]; then
+    echo "  !! CVEs DETECTED:"
+    echo "$REPORT_VULNS" | while read -r c; do echo "     ▸ $c"; done
+    echo ""
+fi
+cat "$OUTDIR/deep_scan.txt"
+echo ""
+fi
+
+echo "════════════════════════════════════════════════════════════════"
+echo "  SCAN COMPLETE — $(date)"
+echo "  Total duration : ${TOTAL_MIN}m ${TOTAL_SEC}s"
+echo "  All files in   : $OUTDIR/"
+echo "════════════════════════════════════════════════════════════════"
+} > "$FINAL_OUT"
+
+# ── Final summary ─────────────────────────────
+echo -e "${GREEN}${BOLD}"
+echo "  ┌──────────────────────────────────────────────────┐"
+echo "  │  Scan Complete                                   │"
+printf "  │  Duration  : %dm %ds%*s│\n" "$TOTAL_MIN" "$TOTAL_SEC" 30 ""
+printf "  │  Open ports: %-35s│\n" "${OPEN_COUNT} TCP ports found"
+printf "  │  Report    : %-35s│\n" "$FINAL_OUT"
+echo "  │                                                  │"
+echo "  │  Output files:                                   │"
+echo "  │    part1-4.txt      — raw TCP SYN parts          │"
+echo "  │    deep_scan.txt    — sV/sC/vuln results         │"
+echo "  │    deep_scan.xml    — machine-readable XML       │"
+echo "  │    open_ports.txt   — clean port list            │"
+echo "  │    FULL_SCAN_*.txt  — merged report              │"
+echo "  └──────────────────────────────────────────────────┘"
+echo -e "${NC}"
